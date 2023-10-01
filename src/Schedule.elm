@@ -1,8 +1,151 @@
 module Schedule exposing (..)
 
+import Date
 import Html exposing (..)
 import Html.Attributes exposing (..)
 import Set exposing (Set)
+import Task
+import Time
+import Time.Extra as Time
+
+
+{-| Given a time, return the next Posix time that the given schedule would occur at.
+-}
+next : Time.Zone -> Time.Posix -> S -> Time.Posix
+next zone now s =
+    case s of
+        Day d s_ ->
+            now
+                -- @TODO this may move before the `now` value... handle that
+                |> moveToDay d zone
+                |> setSchedule zone s_
+
+        Days days s_ ->
+            let
+                nextTime =
+                    days
+                        -- @TODO this may move before the `now` value... handle that
+                        |> List.map (\d -> now |> moveToDay d zone)
+                        |> List.sortBy Time.posixToMillis
+                        |> List.head
+                        |> Maybe.withDefault (Time.millisToPosix 0)
+            in
+            nextTime |> setSchedule zone s_
+
+        First d s_ ->
+            let
+                first =
+                    now |> firstInMonth d s_ zone
+            in
+            if Time.posixToMillis first > Time.posixToMillis now then
+                first
+
+            else
+                now
+                    |> Time.add Time.Month 1 zone
+                    |> firstInMonth d s_ zone
+
+        _ ->
+            Time.millisToPosix 0
+
+
+firstInMonth d s_ zone t =
+    t
+        |> Time.floor Time.Month zone
+        |> moveToDay d zone
+        |> setSchedule zone s_
+
+
+{-| Given a time range, return all the times that the given schedule would occur at, up to {cap} times.
+-}
+nextsWithin : Int -> Time.Posix -> Time.Posix -> Time.Zone -> S -> List Time.Posix
+nextsWithin cap start end zone s =
+    let
+        next_ =
+            next zone start s
+    in
+    if Time.posixToMillis next_ > Time.posixToMillis end || cap > 10 then
+        [ next_ ]
+
+    else
+        -- @TODO we shouldn't be doing the Time.add here – will miss multiple same-day schedules
+        -- for this to work needs to ensure a `next` won't return events < now
+        next_ :: nextsWithin (cap + 1) (next_ |> Time.add Time.Day 1 zone) end zone s
+
+
+moveToDay d zone now =
+    let
+        desiredDay =
+            dayToInt d
+
+        currentDay =
+            now |> Date.fromPosix zone |> Date.weekdayNumber
+
+        daysDifference =
+            desiredDay - currentDay
+
+        -- x =
+        --     Debug.log "things" [ ( "desiredDay", desiredDay ), ( "currentDay", currentDay ), ( "daysDiff", daysDifference ) ]
+    in
+    now
+        |> Time.add Time.Day (modBy 7 daysDifference) zone
+
+
+
+-- oneIndexedMod divisor dividend =
+--     modBy divisor (dividend - 1) + 1
+
+
+setSchedule zone s t =
+    case s of
+        Hour hour ->
+            t
+                |> adjustTime zone
+                    (\v ->
+                        { v
+                            | hour = hour
+                            , minute = 0
+                            , second = 0
+                        }
+                    )
+
+        _ ->
+            t
+
+
+adjustTime zone fn t =
+    t
+        |> Time.posixToParts zone
+        |> fn
+        |> Time.partsToPosix zone
+
+
+fireFor : Time.Posix -> List ( S, Time.Posix -> msg ) -> Cmd msg
+fireFor time schedules =
+    let
+        { minute, hour } =
+            time |> Time.posixToParts Time.utc
+    in
+    schedules
+        |> List.filter
+            (\( schedule_, msg ) ->
+                case schedule_ of
+                    Minute m ->
+                        minute == m
+
+                    Every n s ->
+                        case s of
+                            Hours ->
+                                minute == 0 && modBy n hour == 0
+
+                            _ ->
+                                False
+
+                    _ ->
+                        False
+            )
+        |> List.map (\( schedule_, msg ) -> Task.perform msg Time.now)
+        |> Cmd.batch
 
 
 type S
@@ -16,10 +159,12 @@ type S
     | Minute Int
       -- Hours
     | Midday
+    | Hours
     | Hour Int
     | HoursFrom Int Int
       -- Days
-    | Day Day
+    | Day Day S
+    | Days (List Day) S
     | DaysFrom Day Day
     | DaysOfYear
       -- Months
@@ -31,6 +176,7 @@ type S
       -- Operators
     | Every Int S
     | Group (List S)
+    | First Day S
     | Excluding S
 
 
@@ -71,52 +217,52 @@ dayToString d =
 dayToInt d =
     case d of
         Mon ->
-            0
-
-        Tue ->
             1
 
-        Wed ->
+        Tue ->
             2
 
-        Thu ->
+        Wed ->
             3
 
-        Fri ->
+        Thu ->
             4
 
-        Sat ->
+        Fri ->
             5
 
-        Sun ->
+        Sat ->
             6
+
+        Sun ->
+            7
 
 
 intToDay i =
     case i of
-        0 ->
+        1 ->
             Mon
 
-        1 ->
+        2 ->
             Tue
 
-        2 ->
+        3 ->
             Wed
 
-        3 ->
+        4 ->
             Thu
 
-        4 ->
+        5 ->
             Fri
 
-        5 ->
+        6 ->
             Sat
 
-        6 ->
+        7 ->
             Sun
 
         _ ->
-            Sun
+            Mon
 
 
 main =
@@ -133,9 +279,12 @@ output =
                             toGrid emptyGrid s
                     in
                     div [ style "padding" "5px" ]
-                        [ div [ style "font-family" "monospace", style "background-color" "#ccc", style "display" "inline-block", style "padding" "5px" ] [ text <| Debug.toString s ]
+                        [ div [ style "font-family" "monospace", style "background-color" "#ccc", style "display" "inline-block", style "padding" "5px" ]
+                            [ text <| "NETUERED" ]
+
+                        -- Debug.toString s ]
                         , div [ style "font-weight" "bold" ] [ text <| "⏩ " ++ gridWords grid ]
-                        , div [ style "color" "#eee" ] [ text <| Debug.toString grid ]
+                        , div [ style "color" "#eee" ] [ text <| "NEUTERED" ] --Debug.toString grid ]
                         ]
                 )
             |> div [ style "padding" "20px" ]
@@ -188,12 +337,11 @@ toGrid grid s =
 
         Excluding s_ ->
             let
-                x =
-                    Debug.log "before exclude" grid
-
-                y =
-                    Debug.log "after exclude" excluded
-
+                -- x =
+                --     Debug.log "before exclude" grid
+                --
+                -- y =
+                --     Debug.log "after exclude" excluded
                 excluded =
                     excludeGrid grid (toGrid emptyGrid s_)
             in
@@ -223,8 +371,8 @@ excludeGrid grid exclude =
         days =
             List.filter (\v -> not <| List.member v exclude.days) grid.days
 
-        x =
-            Debug.log "days" days
+        -- x =
+        --     Debug.log "days" days
     in
     { grid | days = days }
 
@@ -329,6 +477,7 @@ toWords s =
 
 
 -- Schedule
+-- Inspired by https://github.com/schyntax/schyntax/blob/master/README.md
 
 
 examples =
@@ -347,7 +496,7 @@ examples =
     -- * An argument preceded by a ! is treated as an exclude. days(!sat..sun) means that Saturday through Sunday are excluded from the schedule.
     -- * All expressions accept any number of arguments, and may mix includes and excludes. For example, you might specify every weekday except tuesday as days(mon..fri, !tues).
     --
-    , Group [ DaysFrom Mon Fri, Excluding (Day Tue) ]
+    , Group [ DaysFrom Mon Fri, Excluding (Day Tue (Hour 0)) ]
 
     -- * All time-related values are evaluated as UTC. hours(12) will be noon UTC, not noon local.
     , Hour 12
@@ -376,13 +525,10 @@ examples =
     , DaysFrom Mon Fri
 
     -- * daysOfWeek(mon) hours(12) will run at noon UTC on Mondays.
-    , Day Mon
-    , Hour 12
+    , Day Mon (Hour 12)
 
     -- * daysOfWeek(mon) minutes(0, 30) will run at the top and half of every hour on Mondays.
-    , Day Mon
-    , Minute 0
-    , Minute 30
+    , Day Mon (Group [ Minute 0, Minute 30 ])
 
     -- * daysOfYear(*) will run at midnight (00:00:00) every day.
     , DaysOfYear
